@@ -10,7 +10,7 @@
 | 项目 | 处理方式 |
 | --- | --- |
 | `PatientName`（含嵌套 PN） | **清空**（保留元素，值置空） |
-| `PatientID`（含嵌套） | **替换**为确定性派生的 12 位数字新 ID（`P` + 12 位） |
+| `PatientID`（含嵌套） | **替换**为 12 位数字新 ID（`P` + 12 位），全局无冲突预留（见下） |
 | `StudyInstanceUID` / `SeriesInstanceUID` / `SOPInstanceUID` | **统一换号** |
 | 上述三类 UID 的**全部嵌套引用**（序列内、文件元信息内） | 同步换号 |
 | 文件元信息 `MediaStorageSOPInstanceUID` | 与新 `SOPInstanceUID` 同步 |
@@ -29,6 +29,17 @@
 - 身份 UID 的角色优先级高于标签提示：例如 `ReferencedStudySequence` 中承载 Study UID 的
   `ReferencedSOPInstanceUID` 会按 study 角色而非 sop 角色换号（见合成样例 `sr_001.dcm`）。
 
+### 患者换号如何保证不共号
+
+- 新患者号首选由SHA-256 **确定性派生**的 `P` + 12 位数字；两个不同原 ID 理论上可能
+  派生出同一新号（碰撞）。
+- 登记在**单个 IMMEDIATE 事务**内完成：已登记的映射原样沿用；新原 ID 若撞上已占用
+  号码，从派生值起做**确定性线性探测**取第一个空位后 `INSERT` 登记
+  （`new_patient_id` 上有 `UNIQUE` 约束兜底，冲突报错而非静默丢弃）。
+- 因此：**不同原 ID 在同批、跨批、并发上传下绝不共号；同一原 ID 重传、失败重试、
+  服务重启后号码不变**；影像（顶层与嵌套）、数据库映射与下载清单三者始终一致。
+- 若探测耗尽仍无法形成无冲突映射，则**整批拒绝**，不产生任何可下载产物。
+
 ## 数据完整性与可靠性保证
 
 1. **同字节复用**：同一 `SOPInstanceUID` 且原文件 SHA-256 相同，直接复用既有处理结果。
@@ -38,7 +49,8 @@
    zip 先写临时文件再 `os.replace`，失败/中断的批次下载返回 409。
 4. **重启恢复**：进程启动时将遗留的 `processing` 批次标记 `failed`；已成功入库的实例与映射
    **保留不丢**，重新上传即可复用且标识不变。
-5. **重试不变号**：确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`），重试绝不改变标识。
+5. **重试不变号**：UID 为确定性派生 + 映射表只插入不更新（`INSERT OR IGNORE`）；
+   患者新号在 IMMEDIATE 事务内完成无冲突预留后即提交，重试、重启绝不改变已登记标识。
 6. **先落盘后入库**：对象文件 `fsync` + 原子 rename 后才写数据库记录。
 
 ## 目录结构
@@ -86,7 +98,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 # 生成含跨文件引用的合成样例
 python samples/generate_samples.py
 
-# 运行测试（15 个，含多进程并发）
+# 运行测试（26 个，含多进程并发与患者新号碰撞回归）
 pytest -q
 
 # 本地启动

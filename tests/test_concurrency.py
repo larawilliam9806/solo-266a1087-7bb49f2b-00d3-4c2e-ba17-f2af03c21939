@@ -126,3 +126,98 @@ def test_cross_process_identical_batches(app, sample_files):
         assert conn.execute("SELECT COUNT(*) c FROM instances").fetchone()["c"] == 4
     finally:
         conn.close()
+
+
+def _patient_worker(data_dir: str, uid_prefix: str, patient_id: str,
+                    sop_uid: str, samples_dir: str, queue) -> None:
+    """子进程：上传一个指定 PatientID/SOP UID 的文件，回报批次状态与清单新号。"""
+    os.environ["DICOM_DATA_DIR"] = data_dir
+    os.environ["DICOM_UID_PREFIX"] = uid_prefix
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import io  # noqa: E402
+    import tempfile  # noqa: E402
+    import zipfile  # noqa: E402
+
+    from werkzeug.datastructures import MultiDict  # noqa: E402
+    from app.web import create_app  # noqa: E402
+
+    ds = pydicom.dcmread(str(Path(samples_dir) / "ct_001.dcm"))
+    ds.PatientID = patient_id
+    ds.SOPInstanceUID = sop_uid
+    ds.file_meta.MediaStorageSOPInstanceUID = sop_uid
+    tmp = Path(tempfile.mkdtemp()) / "patient.dcm"
+    ds.save_as(str(tmp), write_like_original=False)
+
+    client = create_app().test_client()
+    data = MultiDict()
+    data.add("dicom_files", (open(tmp, "rb"), "patient.dcm", "application/dicom"))
+    resp = client.post("/upload", data=data, content_type="multipart/form-data")
+    bid = resp.headers["Location"].rstrip("/").split("/")[-1]
+    download = client.get(f"/batches/{bid}/download")
+    if download.status_code != 200:
+        queue.put(("failed", bid, None))
+        return
+    zf = zipfile.ZipFile(io.BytesIO(download.data))
+    manifest = zf.read("manifest.csv").decode("utf-8-sig").splitlines()
+    new_pid = manifest[1].split(",")[2]
+    queue.put(("ready", bid, new_pid))
+
+
+def test_cross_process_patient_id_collision(app, client, sample_files):
+    """多进程并发 + 患者新号碰撞：先占位派生槽位，两个进程上传同一新患者，
+    必须得到同一个探测空位（不共号、不变号、两批都可下载）。"""
+    from app import identifiers
+    from app.db import get_db, immediate_tx
+
+    data_dir = os.environ["DICOM_DATA_DIR"]
+    uid_prefix = os.environ["DICOM_UID_PREFIX"]
+    patient_id = "PAT-REMOTE-1"
+    derived = identifiers.derive_patient_id(patient_id)
+    expected = identifiers.patient_id_candidate(patient_id, 1)
+
+    # 预置占位映射：另一个原 ID 已占用 PAT-REMOTE-1 的派生新号
+    conn = get_db()
+    try:
+        with immediate_tx(conn):
+            conn.execute(
+                "INSERT INTO patient_mappings(original_patient_id, new_patient_id) "
+                "VALUES(?,?)",
+                ("PAT-PLACEHOLDER", derived),
+            )
+    finally:
+        conn.close()
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_patient_worker,
+            args=(data_dir, uid_prefix, patient_id,
+                  f"1.2.826.0.1.9999.8807.{i + 1}", str(sample_files), queue),
+        )
+        for i in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0
+    results = [queue.get() for _ in procs]
+
+    # 两批都成功，且清单新号一致地落在派生值的下一个空位
+    assert all(status == "ready" for status, _, _ in results)
+    assert {new_pid for _, _, new_pid in results} == {expected}
+    assert expected != derived
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT original_patient_id, new_patient_id FROM patient_mappings"
+        ).fetchall()
+        mapping = {r["original_patient_id"]: r["new_patient_id"] for r in rows}
+        # 占位映射保留；同一原 ID 只有一条映射；不同原 ID 不共号
+        assert mapping["PAT-PLACEHOLDER"] == derived
+        assert mapping[patient_id] == expected
+        assert len(set(mapping.values())) == len(mapping)
+    finally:
+        conn.close()

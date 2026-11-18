@@ -3,6 +3,11 @@
 同一原标识在任何时间、任何批次、任何并发 worker 上都派生出同一个新标识，
 因此“引用先上传、实例后上传”也天然一致，且不依赖先写库再查库的顺序。
 派生结果同时持久化到 SQLite 作为审计与数据湖关联依据。
+
+患者新号（P + 12 位数字）的派生值存在理论上的碰撞可能：两个不同原 ID 可能
+派生出同一新号。碰撞由 dicom_proc.persist_mappings 在登记时以确定性线性
+探测（patient_id_candidate）解决，保证不同原 ID 绝不共号、同一原 ID 一旦
+登记永不换号。
 """
 from __future__ import annotations
 
@@ -52,3 +57,20 @@ def derive_patient_id(original_patient_id: str) -> str:
     """确定性派生 12 位数字患者 ID（零填充，定长便于数据湖关联）。"""
     n = _digest("patient", original_patient_id)
     return f"P{n % 10**12:012d}"
+
+
+# 患者新号冲突时的确定性探测上限：从派生值起线性探测空位，
+# 超过该次数仍无空位即判定无法形成无冲突映射（由调用方整批拒绝）。
+# 12 位数字空间为 10^12，实际冲突极其罕见，该上限只是兜底。
+MAX_PATIENT_ID_ATTEMPTS = 4096
+
+
+def patient_id_candidate(original_patient_id: str, attempt: int) -> str:
+    """第 attempt 个候选新患者号（保持 P + 12 位数字格式）。
+
+    attempt=0 即纯派生值 derive_patient_id；当派生值已被其他原 ID 占用时，
+    attempt 递增做确定性线性探测（对 10^12 取模回绕）。在相同的全局占用
+    状态下，同一原 ID 总会探测到同一个空位，因此分配结果可复现。
+    """
+    base = int(derive_patient_id(original_patient_id)[1:])
+    return f"P{(base + attempt) % 10**12:012d}"

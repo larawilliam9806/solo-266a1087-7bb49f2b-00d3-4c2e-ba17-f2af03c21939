@@ -91,14 +91,22 @@ def _build_manifest(batch_id: str) -> bytes:
                 "SELECT new_patient_id FROM patient_mappings WHERE original_patient_id=?",
                 (f["original_patient_id"],),
             ).fetchone()
+            # 映射缺失说明库内状态与批次不一致，绝不允许产出新号为空的清单：
+            # 让整批失败，而不是发布与影像/数据库不一致的产物
+            if inst is None or study_new is None or series_new is None \
+                    or pid_new is None:
+                raise BatchError(
+                    f"批次 {batch_id} 的映射登记不完整"
+                    f"（文件 {f['orig_name']}），整批不得发布"
+                )
             writer.writerow([
                 f["orig_name"],
                 f["original_patient_id"],
-                pid_new["new_patient_id"] if pid_new else "",
+                pid_new["new_patient_id"],
                 f["original_study_uid"],
-                study_new["new_uid"] if study_new else "",
+                study_new["new_uid"],
                 f["original_series_uid"],
-                series_new["new_uid"] if series_new else "",
+                series_new["new_uid"],
                 f["sop_uid"],
                 inst["new_sop_uid"],
                 inst["sha256"],

@@ -5,12 +5,16 @@
 - 仅对 Study/Series/SOP 三类 UID 及其嵌套引用换号；
 - SOP Class UID、Transfer Syntax UID、FrameOfReferenceUID 等其他 UID 不动；
 - 像素数据与传输语法原样保留（只接受未压缩传输语法）；
-- 同字节实例复用既有结果，字节冲突整批拒绝。
+- 同字节实例复用既有结果，字节冲突整批拒绝；
+- 患者新号全局唯一：不同原 PatientID 绝不共号，同一原 ID 一旦登记永不换号，
+  无法形成无冲突映射时整批拒绝。
 """
 from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -118,6 +122,29 @@ def _ui_values(elem) -> list[str]:
     if isinstance(value, (list, pydicom.multival.MultiValue)):
         return [v for v in value if v]
     return [value]
+
+
+def _iter_patient_id_values(ds: pydicom.Dataset) -> list[str]:
+    """收集数据集（含序列嵌套）中的全部 PatientID 值。
+
+    嵌套 PatientID 与顶层一样必须纳入统一的无冲突预留，否则输出影像中的
+    嵌套值可能与数据库映射不一致。
+    """
+    values: list[str] = []
+
+    def callback(_ds, elem):
+        if elem.tag != TAG_PATIENT_ID:
+            return
+        value = elem.value
+        if value is None:
+            return
+        if isinstance(value, (list, pydicom.multival.MultiValue)):
+            values.extend(str(v) for v in value)
+        else:
+            values.append(str(value))
+
+    ds.walk(callback, recursive=True)
+    return values
 
 
 def _read_and_validate(path: Path) -> pydicom.Dataset:
@@ -245,10 +272,15 @@ def plan_batch(tmp_files: list[tuple[str, Path]]) -> BatchPlan:
                     )
                 plan.value_roles[row["original_uid"]] = row["role"]
 
-        # 4) 确定性派生全部新 UID 与新 PatientID
+        # 4) 确定性派生全部新 UID；患者新号此处仅填派生候选，
+        #    真正的无冲突预留在 persist_mappings 中完成并回写 patient_remap。
+        #    患者集合包含顶层与全部嵌套 PatientID，保证影像任何位置的
+        #    患者号都与数据库映射一致。
         for original_uid, role in plan.value_roles.items():
             plan.uid_remap[original_uid] = identifiers.derive_uid(role, original_uid)
         patient_ids = {f.patient_id for f in plan.files}
+        for f in plan.files:
+            patient_ids.update(_iter_patient_id_values(f.ds))
         for pid in patient_ids:
             plan.patient_remap[pid] = identifiers.derive_patient_id(pid)
         return plan
@@ -305,8 +337,71 @@ def _atomic_write_object(ds: pydicom.Dataset, object_relpath: str) -> Path:
     return final_path
 
 
+def _reserve_patient_ids(
+    conn: sqlite3.Connection, original_ids: Iterable[str]
+) -> dict[str, str]:
+    """在 conn 的当前事务内为每个原 PatientID 预留无冲突新号。
+
+    规则：
+    - 已登记的映射原样沿用（重传、失败重试、服务重启后均不变号）；
+    - 新原 ID 从派生值起做确定性线性探测，取第一个未被任何其他原 ID
+      占用的空位——不同原 ID 在同批、跨批、并发下都绝不共号；
+    - 探测耗尽说明无法形成无冲突映射，抛 BatchRejected 整批拒绝。
+
+    调用方必须持有 IMMEDIATE 事务：并发 worker 的预留彼此串行，
+    后进入的事务能读到先提交者的登记结果；new_patient_id 上的
+    UNIQUE 约束作为最后兜底，任何冲突都报错而非静默丢弃。
+    """
+    remap: dict[str, str] = {}
+    # 排序使同批内的分配顺序与文件上传顺序无关，结果可复现
+    for pid in sorted(original_ids):
+        row = conn.execute(
+            "SELECT new_patient_id FROM patient_mappings "
+            "WHERE original_patient_id=?",
+            (pid,),
+        ).fetchone()
+        if row is not None:
+            remap[pid] = row["new_patient_id"]
+            continue
+        for attempt in range(identifiers.MAX_PATIENT_ID_ATTEMPTS):
+            candidate = identifiers.patient_id_candidate(pid, attempt)
+            taken = conn.execute(
+                "SELECT 1 FROM patient_mappings WHERE new_patient_id=?",
+                (candidate,),
+            ).fetchone()
+            if taken is not None:
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO patient_mappings"
+                    "(original_patient_id, new_patient_id) VALUES(?,?)",
+                    (pid, candidate),
+                )
+            except sqlite3.IntegrityError as exc:
+                # UNIQUE 兜底：绝不静默丢弃映射（旧缺陷：INSERT OR IGNORE
+                # 会把冲突行吞掉，导致影像共号且清单新号为空）
+                raise BatchRejected(
+                    f"患者新号 {candidate} 登记时与其他原 ID 冲突，整批拒绝"
+                ) from exc
+            remap[pid] = candidate
+            break
+        else:
+            raise BatchRejected(
+                f"原 PatientID 的新号候选探测耗尽"
+                f"（{identifiers.MAX_PATIENT_ID_ATTEMPTS} 次），"
+                "无法形成无冲突映射，整批拒绝"
+            )
+    return remap
+
+
 def persist_mappings(plan: BatchPlan) -> None:
-    """持久化 UID/患者映射（只插入不更新；确定性派生保证值恒定）。"""
+    """持久化 UID/患者映射（只插入不更新）。
+
+    UID 映射是纯函数派生，INSERT OR IGNORE 幂等；患者新号在同一
+    IMMEDIATE 事务内完成无冲突预留，并把实际登记结果回写
+    plan.patient_remap，保证输出影像、数据库映射与下载清单三者一致。
+    预留随事务提交即生效，即使后续处理失败，重试时同一原 ID 也不变号。
+    """
     conn = get_db()
     try:
         with immediate_tx(conn):
@@ -316,12 +411,9 @@ def persist_mappings(plan: BatchPlan) -> None:
                     "VALUES(?,?,?)",
                     (role, original_uid, plan.uid_remap[original_uid]),
                 )
-            for orig_pid, new_pid in plan.patient_remap.items():
-                conn.execute(
-                    "INSERT OR IGNORE INTO patient_mappings(original_patient_id, new_patient_id) "
-                    "VALUES(?,?)",
-                    (orig_pid, new_pid),
-                )
+            plan.patient_remap = _reserve_patient_ids(
+                conn, plan.patient_remap.keys()
+            )
     finally:
         conn.close()
 
